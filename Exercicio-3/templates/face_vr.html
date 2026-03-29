@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Tracking → VR</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+
+  <!--
+    A-Frame: biblioteca WebXR que transforma HTML em cena 3D/VR.
+    Usamos a versão local (vendor) para funcionar sem internet.
+  -->
+  <script src="/static/vendor/aframe.min.js"></script>
+
+  <!-- Socket.IO: comunicação WebSocket bidirecional em tempo real -->
+  <script src="/static/vendor/socket.io.min.js"></script>
+
+  <style>
+    /* Layout principal: câmera à esquerda, VR à direita */
+    .face-vr-layout {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      grid-template-rows: auto 1fr;
+      gap: .6rem;
+      padding: .6rem .8rem;
+      height: calc(100vh - 55px);
+    }
+
+    /* Toolbar ocupa toda a largura */
+    .fv-toolbar {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: .8rem;
+      flex-wrap: wrap;
+      background: var(--darker);
+      border-radius: 8px;
+      padding: .5rem .8rem;
+    }
+
+    /* Painel esquerdo: câmera + info */
+    .fv-left {
+      display: flex;
+      flex-direction: column;
+      gap: .5rem;
+      overflow: hidden;
+    }
+
+    /* Feed de vídeo/imagem anotada */
+    .video-box {
+      background: #000;
+      border-radius: 10px;
+      overflow: hidden;
+      flex: 1;
+      min-height: 0;
+      position: relative;
+    }
+    .video-box video, .video-box img {
+      width: 100%; height: 100%; object-fit: contain; display: block;
+    }
+
+    /* Painel direito: cena A-Frame */
+    .fv-right {
+      position: relative;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #111;
+    }
+    /* A-Frame ocupa 100% do contêiner */
+    a-scene {
+      width: 100% !important;
+      height: 100% !important;
+    }
+
+    /* Lista de rostos detectados */
+    .face-list {
+      background: var(--darker);
+      border-radius: 8px;
+      padding: .5rem;
+      font-size: .82rem;
+      max-height: 160px;
+      overflow-y: auto;
+    }
+    .face-item {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      padding: .25rem .4rem;
+      border-radius: 4px;
+      margin-bottom: .2rem;
+      background: var(--card-bg);
+    }
+    .face-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+    /* Badge de FPS sobreposto ao vídeo */
+    .fps-badge {
+      position: absolute; top:.5rem; left:.5rem;
+      background: rgba(0,0,0,.6); color: #0f0;
+      font-size: .75rem; padding: .2rem .5rem;
+      border-radius: 4px; font-family: monospace;
+    }
+    /* Badge de contagem sobreposto ao VR */
+    .vr-badge {
+      position: absolute; top:.5rem; left:.5rem; z-index: 10;
+      background: rgba(0,0,0,.6); color: #4fc3f7;
+      font-size: .8rem; padding: .3rem .6rem;
+      border-radius: 4px; pointer-events: none;
+    }
+    /* Legenda de instruções sobre o canvas VR */
+    .vr-hint {
+      position: absolute; bottom:.5rem; left:50%; transform:translateX(-50%);
+      z-index: 10; background: rgba(0,0,0,.55); color: #ccc;
+      font-size: .75rem; padding: .25rem .7rem; border-radius: 12px;
+      pointer-events: none; white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Navbar de navegação -->
+<nav class="navbar">
+  <div class="navbar-brand">👤 Face Tracking → VR</div>
+  <div class="navbar-links">
+    <a href="/">Início</a>
+    <a href="/arvr">AR/VR</a>
+    <a href="/cv">Visão Computacional</a>
+    <a href="/cv3d">CV → 3D</a>
+    <a href="/face_vr" class="active">Face → VR</a>
+  </div>
+  <div id="wsStatus" class="status-badge">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Desconectado</span>
+  </div>
+</nav>
+
+<div class="face-vr-layout">
+
+  <!-- ── Toolbar de controles ──────────────────────────────────────── -->
+  <div class="fv-toolbar">
+    <button id="btnStart" class="btn btn-primary btn-sm" onclick="startCamera()">
+      📷 Iniciar Câmera
+    </button>
+    <button id="btnStop" class="btn btn-outline btn-sm" onclick="stopCamera()" disabled>
+      ⏹ Parar
+    </button>
+
+    <!-- FPS de envio de frames ao servidor -->
+    <label class="form-label" style="margin:0;display:flex;align-items:center;gap:.4rem">
+      <span style="font-size:.8rem;color:var(--text-muted)">FPS envio:</span>
+      <select id="fpsSelect" class="form-control" style="width:70px;padding:.2rem .4rem;font-size:.8rem">
+        <option value="5">5</option>
+        <option value="10" selected>10</option>
+        <option value="15">15</option>
+        <option value="20">20</option>
+      </select>
+    </label>
+
+    <!-- Selecionar câmera (frente/traseira para celular) -->
+    <label class="form-label" style="margin:0;display:flex;align-items:center;gap:.4rem">
+      <span style="font-size:.8rem;color:var(--text-muted)">Câmera:</span>
+      <select id="facingSelect" class="form-control" style="width:100px;padding:.2rem .4rem;font-size:.8rem">
+        <option value="user">Frontal</option>
+        <option value="environment">Traseira</option>
+      </select>
+    </label>
+
+    <div id="connInfo" style="font-size:.8rem;color:var(--text-muted);margin-left:auto">
+      Aguardando conexão…
+    </div>
+  </div>
+
+  <!-- ── Painel esquerdo: câmera ────────────────────────────────────── -->
+  <div class="fv-left">
+
+    <!-- Feed da câmera (original) -->
+    <div class="card" style="flex-shrink:0">
+      <div class="card-title">📸 Câmera</div>
+    </div>
+    <div class="video-box" style="max-height:220px">
+      <!--
+        <video> exibe o feed bruto da câmera.
+        <canvas> (oculto) é usado para capturar frames e enviá-los ao servidor.
+      -->
+      <video id="videoEl" autoplay playsinline muted></video>
+      <canvas id="captureCanvas" style="display:none"></canvas>
+      <span class="fps-badge" id="fpsBadge">-- fps</span>
+      <div class="no-signal" id="noSignal">
+        <span style="font-size:2rem">📷</span>
+        <span>Clique em "Iniciar Câmera"</span>
+      </div>
+    </div>
+
+    <!-- Frame anotado retornado pelo servidor (com bounding boxes) -->
+    <div class="card" style="flex-shrink:0">
+      <div class="card-title">🔍 Detecção (servidor)</div>
+    </div>
+    <div class="video-box" style="flex:1">
+      <!--
+        <img> recebe o frame processado pelo servidor:
+        já vem com os retângulos de detecção e os labels "Pessoa N".
+      -->
+      <img id="annotatedImg" src="" alt="" style="display:none">
+      <div class="no-signal" id="noAnnotated">
+        <span style="font-size:1.5rem">🔍</span>
+        <span>Aguardando detecção…</span>
+      </div>
+    </div>
+
+    <!-- Lista de rostos detectados -->
+    <div class="face-list" id="faceList">
+      <div style="color:var(--text-muted);font-size:.8rem">Nenhum rosto detectado.</div>
+    </div>
+
+  </div>
+
+  <!-- ── Painel direito: cena A-Frame VR ───────────────────────────── -->
+  <div class="fv-right">
+
+    <div class="vr-badge" id="vrBadge">👤 0 pessoa(s) no mundo VR</div>
+    <div class="vr-hint">🖱 Arraste para olhar em volta · WASD para mover</div>
+
+    <!--
+      Cena A-Frame: define o mundo VR.
+
+      Componentes usados:
+        <a-sky>         – cor de fundo (céu)
+        <a-plane>       – chão
+        <a-entity>      – câmera com controles WASD + mouse look
+        <a-entity id="avatarsContainer"> – contêiner onde os avatares são inseridos dinamicamente
+        <a-entity light> – iluminação ambiente + direcional
+    -->
+    <a-scene
+      embedded
+      background="color: #1a1a2e"
+      fog="type: exponential; color: #1a1a2e; density: 0.05"
+      renderer="antialias: true"
+    >
+
+      <!-- Iluminação -->
+      <a-entity light="type: ambient; color: #4466aa; intensity: 0.6"></a-entity>
+      <a-entity light="type: directional; color: #ffffff; intensity: 0.8"
+                position="5 10 5"></a-entity>
+
+      <!-- Céu estrelado simples -->
+      <a-sky color="#0d0d1a"></a-sky>
+
+      <!-- Chão -->
+      <a-plane
+        position="0 0 0"
+        rotation="-90 0 0"
+        width="40" height="40"
+        color="#1a2a1a"
+        roughness="1"
+      ></a-plane>
+
+      <!-- Grade de referência no chão para dar sensação de profundidade -->
+      <a-entity id="gridLines"></a-entity>
+
+      <!--
+        Contêiner dos avatares gerados dinamicamente pelo JavaScript.
+        Para cada rosto detectado, um <a-entity> é criado/atualizado aqui.
+      -->
+      <a-entity id="avatarsContainer"></a-entity>
+
+      <!--
+        Câmera com:
+          wasd-controls  – mover com teclado W/A/S/D
+          look-controls  – olhar com mouse/toque
+      -->
+      <a-entity position="0 1.6 8">
+        <a-camera wasd-controls look-controls></a-camera>
+      </a-entity>
+
+    </a-scene>
+
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Estado global
+// ============================================================
+const socket = io();           // conexão Socket.IO
+let stream = null;             // stream de vídeo da câmera
+let sendInterval = null;       // intervalo de envio de frames
+let lastFrameTime = 0;         // timestamp do último frame enviado
+let frameCount = 0;            // contador de frames para calcular FPS
+let fpsTimer = 0;              // timer do FPS
+
+// Cores fixas para cada "Pessoa N" (ciclam se houver mais de 8)
+const AVATAR_COLORS = [
+  "#4fc3f7", "#ef5350", "#66bb6a", "#ffa726",
+  "#ab47bc", "#26c6da", "#d4e157", "#ff7043",
+];
+
+// Referências aos avatares A-Frame por ID de rosto
+// avatarMap[faceId] = { entity, sphere, label }
+const avatarMap = {};
+
+// ============================================================
+// Conexão Socket.IO
+// ============================================================
+socket.on("connect", () => {
+  document.getElementById("statusDot").style.background = "#4caf50";
+  document.getElementById("statusText").textContent = "Conectado";
+  document.getElementById("connInfo").textContent = "Socket.IO conectado.";
+
+  // Entra na sala face_vr (tanto câmera quanto VR compartilham a mesma sala)
+  socket.emit("join_face_vr");
+});
+
+socket.on("disconnect", () => {
+  document.getElementById("statusDot").style.background = "#f44336";
+  document.getElementById("statusText").textContent = "Desconectado";
+});
+
+socket.on("face_vr_ready", (data) => {
+  document.getElementById("connInfo").textContent = data.message;
+});
+
+// ============================================================
+// Receber atualização de rostos do servidor
+// ============================================================
+socket.on("face_vr_update", (data) => {
+  if (data.error) {
+    console.warn("Erro do servidor:", data.error);
+    return;
+  }
+
+  const faces = data.faces || [];
+
+  // ── 1. Atualizar frame anotado ──────────────────────────────────
+  if (data.image) {
+    const img = document.getElementById("annotatedImg");
+    img.src = data.image;
+    img.style.display = "block";
+    document.getElementById("noAnnotated").style.display = "none";
+  }
+
+  // ── 2. Atualizar cena VR (avatares) ────────────────────────────
+  updateVRScene(faces);
+
+  // ── 3. Atualizar lista de rostos detectados ─────────────────────
+  updateFaceList(faces);
+
+  // ── 4. Atualizar badge de contagem ─────────────────────────────
+  document.getElementById("vrBadge").textContent =
+    `👤 ${faces.length} pessoa(s) no mundo VR`;
+});
+
+// ============================================================
+// Atualizar cena A-Frame com avatares por rosto
+// ============================================================
+function updateVRScene(faces) {
+  const container = document.getElementById("avatarsContainer");
+  const activeFaceIds = new Set(faces.map(f => f.id));
+
+  // ── Remover avatares de rostos que sumiram ──────────────────────
+  for (const faceId of Object.keys(avatarMap)) {
+    if (!activeFaceIds.has(parseInt(faceId))) {
+      avatarMap[faceId].entity.parentNode.removeChild(avatarMap[faceId].entity);
+      delete avatarMap[faceId];
+    }
+  }
+
+  // ── Criar ou atualizar avatar para cada rosto ───────────────────
+  for (const face of faces) {
+    const { id, label, vr } = face;
+    const color = AVATAR_COLORS[(id - 1) % AVATAR_COLORS.length];
+
+    if (avatarMap[id]) {
+      // Avatar já existe → apenas atualizar posição suavemente
+      // A-Frame lê o atributo "position" diretamente como string "x y z"
+      avatarMap[id].entity.setAttribute(
+        "position", `${vr.x} ${vr.y} ${vr.z}`
+      );
+      // Escala proporcional ao tamanho do rosto (mais perto = maior)
+      avatarMap[id].sphere.setAttribute(
+        "scale", `${vr.scale} ${vr.scale} ${vr.scale}`
+      );
+    } else {
+      // ── Criar novo avatar ─────────────────────────────────────
+      /*
+        Estrutura do avatar:
+          <a-entity position="x y z">              ← grupo pai
+            <a-sphere radius="0.4" color="...">    ← "cabeça"
+            <a-cylinder ...>                        ← "corpo"
+            <a-text value="Pessoa N" ...>           ← label flutuante
+          </a-entity>
+      */
+      const entity = document.createElement("a-entity");
+      entity.setAttribute("position", `${vr.x} ${vr.y} ${vr.z}`);
+
+      // Cabeça (esfera)
+      const sphere = document.createElement("a-sphere");
+      sphere.setAttribute("radius", "0.4");
+      sphere.setAttribute("color", color);
+      sphere.setAttribute("metalness", "0.1");
+      sphere.setAttribute("roughness", "0.6");
+      sphere.setAttribute("scale", `${vr.scale} ${vr.scale} ${vr.scale}`);
+      // Animação de pulsação suave para indicar pessoa "viva"
+      sphere.setAttribute("animation",
+        "property: scale; " +
+        `to: ${vr.scale * 1.1} ${vr.scale * 1.1} ${vr.scale * 1.1}; ` +
+        "dir: alternate; dur: 800; loop: true; easing: easeInOutSine"
+      );
+
+      // Corpo (cilindro abaixo da cabeça)
+      const body = document.createElement("a-cylinder");
+      body.setAttribute("position", "0 -0.7 0");
+      body.setAttribute("height", "0.8");
+      body.setAttribute("radius", "0.2");
+      body.setAttribute("color", color);
+      body.setAttribute("opacity", "0.7");
+
+      // Label com nome (texto flutuante acima da cabeça)
+      const text = document.createElement("a-text");
+      text.setAttribute("value", label);
+      text.setAttribute("position", "0 0.7 0");
+      text.setAttribute("align", "center");
+      text.setAttribute("color", "#ffffff");
+      text.setAttribute("width", "2.5");
+      // billboard: texto sempre de frente para a câmera
+      text.setAttribute("look-at", "[camera]");
+
+      // Linha vertical do chão até o avatar (indicador de profundidade)
+      const line = document.createElement("a-cylinder");
+      line.setAttribute("position", `0 ${-vr.y} 0`);
+      line.setAttribute("height", `${vr.y * 2}`);
+      line.setAttribute("radius", "0.02");
+      line.setAttribute("color", color);
+      line.setAttribute("opacity", "0.3");
+
+      entity.appendChild(sphere);
+      entity.appendChild(body);
+      entity.appendChild(text);
+      entity.appendChild(line);
+      container.appendChild(entity);
+
+      avatarMap[id] = { entity, sphere, text };
+    }
+  }
+}
+
+// ============================================================
+// Atualizar lista de rostos no painel esquerdo
+// ============================================================
+function updateFaceList(faces) {
+  const list = document.getElementById("faceList");
+  if (faces.length === 0) {
+    list.innerHTML = '<div style="color:var(--text-muted);font-size:.8rem">Nenhum rosto detectado.</div>';
+    return;
+  }
+  list.innerHTML = faces.map(f => {
+    const color = AVATAR_COLORS[(f.id - 1) % AVATAR_COLORS.length];
+    return `
+      <div class="face-item">
+        <div class="face-dot" style="background:${color}"></div>
+        <span><strong>${f.label}</strong></span>
+        <span style="color:var(--text-muted);font-size:.75rem;margin-left:auto">
+          VR: x=${f.vr.x} &nbsp; z=${f.vr.z}
+        </span>
+      </div>`;
+  }).join("");
+}
+
+// ============================================================
+// Câmera: iniciar/parar
+// ============================================================
+async function startCamera() {
+  const facing = document.getElementById("facingSelect").value;
+  try {
+    // getUserMedia solicita acesso à câmera.
+    // facingMode: "user" = câmera frontal, "environment" = traseira (celular)
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+    const video = document.getElementById("videoEl");
+    video.srcObject = stream;
+    document.getElementById("noSignal").style.display = "none";
+    document.getElementById("btnStart").disabled = true;
+    document.getElementById("btnStop").disabled = false;
+
+    // Iniciar envio periódico de frames ao servidor
+    startSendingFrames();
+  } catch (err) {
+    alert("Erro ao acessar a câmera: " + err.message);
+  }
+}
+
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  clearInterval(sendInterval);
+  sendInterval = null;
+
+  document.getElementById("videoEl").srcObject = null;
+  document.getElementById("noSignal").style.display = "flex";
+  document.getElementById("annotatedImg").style.display = "none";
+  document.getElementById("noAnnotated").style.display = "flex";
+  document.getElementById("btnStart").disabled = false;
+  document.getElementById("btnStop").disabled = true;
+
+  // Limpar todos os avatares da cena
+  document.getElementById("avatarsContainer").innerHTML = "";
+  Object.keys(avatarMap).forEach(k => delete avatarMap[k]);
+  updateFaceList([]);
+  document.getElementById("vrBadge").textContent = "👤 0 pessoa(s) no mundo VR";
+  document.getElementById("fpsBadge").textContent = "-- fps";
+}
+
+// ============================================================
+// Captura e envio de frames ao servidor
+// ============================================================
+function startSendingFrames() {
+  clearInterval(sendInterval);
+
+  const fps = parseInt(document.getElementById("fpsSelect").value);
+  const interval = 1000 / fps;   // milissegundos entre frames
+
+  fpsTimer = Date.now();
+  frameCount = 0;
+
+  sendInterval = setInterval(() => {
+    if (!stream) return;
+
+    const video = document.getElementById("videoEl");
+    const canvas = document.getElementById("captureCanvas");
+
+    // Ajustar canvas ao tamanho atual do vídeo
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+
+    const ctx = canvas.getContext("2d");
+
+    /*
+      Espelhar horizontalmente: como a câmera frontal é um espelho,
+      invertemos a imagem para que "esquerda na tela = esquerda real".
+      Isso garante que o mapeamento de coordenadas seja intuitivo.
+    */
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // Converter canvas para JPEG base64 (qualidade 0.7 = 70% para economizar banda)
+    const imageData = canvas.toDataURL("image/jpeg", 0.7);
+
+    // Enviar frame ao servidor via Socket.IO
+    socket.emit("face_vr_frame", { image: imageData });
+
+    // Calcular FPS real
+    frameCount++;
+    const now = Date.now();
+    if (now - fpsTimer >= 1000) {
+      document.getElementById("fpsBadge").textContent = `${frameCount} fps`;
+      frameCount = 0;
+      fpsTimer = now;
+    }
+  }, interval);
+}
+
+// Atualizar FPS se o usuário mudar o select enquanto a câmera está ativa
+document.getElementById("fpsSelect").addEventListener("change", () => {
+  if (stream) startSendingFrames();
+});
+</script>
+</body>
+</html>

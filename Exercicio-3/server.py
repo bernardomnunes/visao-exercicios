@@ -52,7 +52,12 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger
 # ---------------------------------------------------------------------------
 # MediaPipe – Detecção de mãos e pose (Tasks API)
 # ---------------------------------------------------------------------------
-_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+# MediaPipe e OpenCV usam C++ internamente e não lidam com acentos em caminhos no Windows.
+# Por isso modelos e arquivos auxiliares ficam em ~/mediapipe_models (sem caracteres especiais).
+_MODELS_DIR = os.path.join(os.path.expanduser("~"), "mediapipe_models")
+
+# Caminho do classificador Haar Cascade sem acentos (OpenCV C++ também não lida com acentos)
+_HAAR_FACE_XML = os.path.join(_MODELS_DIR, "haarcascade_frontalface_default.xml")
 
 _MP_MODELS = {
     "hand_landmarker.task": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
@@ -133,7 +138,7 @@ scene_state = {
 }
 
 # Contadores simples de conexões
-connected_clients = {"arvr": 0, "cv": 0, "cv3d": 0, "worldgen": 0}
+connected_clients = {"arvr": 0, "cv": 0, "cv3d": 0, "worldgen": 0, "face_vr": 0}
 
 # ---------------------------------------------------------------------------
 # OpenAI – AI World Generator
@@ -528,6 +533,16 @@ def worldgen_page():
     return render_template("worldgen.html")
 
 
+@app.route("/face_vr")
+def face_vr_page():
+    """
+    Interface de Rastreamento de Rostos → VR.
+    Câmera detecta rostos em tempo real e mapeia cada rosto como um avatar
+    na cena A-Frame (Realidade Virtual).
+    """
+    return render_template("face_vr.html")
+
+
 # ---------------------------------------------------------------------------
 # Eventos Socket.IO – conexão/desconexão
 # ---------------------------------------------------------------------------
@@ -732,7 +747,7 @@ def _apply_pipeline(frame: np.ndarray, pipeline: str):
     elif pipeline == "faces":
         # Usa classificador Haar para detecção de rostos
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        face_cascade = cv2.CascadeClassifier(_HAAR_FACE_XML)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         result = frame.copy()
         for (x, y, w, h) in faces:
@@ -924,7 +939,7 @@ def _apply_pipeline_3d(frame: np.ndarray, pipeline: str):
     elif pipeline == "faces":
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            _HAAR_FACE_XML
         )
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         rects = []
@@ -1224,6 +1239,175 @@ def on_worldgen_share(data):
             "html": html,
             "prompt": prompt,
         }, to="worldgen", include_self=False)
+
+
+# ---------------------------------------------------------------------------
+# Eventos Socket.IO – Face Tracking → VR
+# ---------------------------------------------------------------------------
+
+# Classificador Haar reutilizável (carregado uma vez em memória)
+_face_cascade = cv2.CascadeClassifier(
+    _HAAR_FACE_XML
+)
+
+
+def _map_face_to_vr(face: dict, frame_w: int) -> dict:
+    """
+    Converte as coordenadas 2D de um rosto (bounding box da câmera)
+    para coordenadas 3D no espaço A-Frame.
+
+    Sistema de coordenadas A-Frame:
+      - Eixo X: -esquerda / +direita
+      - Eixo Y: -baixo / +cima
+      - Eixo Z: -frente (longe da câmera) / +trás (atrás da câmera)
+
+    Regras de mapeamento:
+      - Rosto à esquerda da imagem  → objeto à esquerda no VR  (X negativo)
+      - Rosto à direita da imagem   → objeto à direita no VR   (X positivo)
+      - Bounding box maior (rosto perto) → Z menos negativo (mais próximo)
+      - Bounding box menor (rosto longe) → Z mais negativo (mais afastado)
+    """
+    # Centro horizontal do rosto na imagem (pixels)
+    cx = face["x"] + face["w"] / 2
+
+    # Proporção do tamanho do rosto em relação à largura do frame (0.0 a 1.0)
+    # Quanto maior este valor, mais próximo o rosto está da câmera
+    size_ratio = face["w"] / frame_w
+
+    # Mapeamento X: imagem [0, frame_w] → VR [-5, +5] metros
+    # Espelhado: rosto à esquerda na câmera = objeto à esquerda no VR
+    vr_x = (cx / frame_w - 0.5) * 10
+
+    # Altura fixa a 1.5m (nível dos olhos de uma pessoa em pé)
+    vr_y = 1.5
+
+    # Mapeamento Z (profundidade):
+    #   size_ratio ≈ 0.05 (rosto pequeno/longe) → z ≈ -8  (longe no VR)
+    #   size_ratio ≈ 0.50 (rosto grande/perto)  → z ≈ -2  (perto no VR)
+    # Clamp para evitar que size_ratio enorme coloque o objeto atrás da câmera
+    depth_factor = min(size_ratio * 2.5, 1.0)   # normaliza para [0, 1]
+    vr_z = -2.0 - (1.0 - depth_factor) * 6.0    # intervalo: [-8, -2]
+
+    return {
+        "x": round(vr_x, 2),
+        "y": round(vr_y, 2),
+        "z": round(vr_z, 2),
+        # Tamanho do avatar proporcional ao rosto (entre 0.3 e 1.0 metros)
+        "scale": round(0.3 + depth_factor * 0.7, 2),
+    }
+
+
+@socketio.on("join_face_vr")
+def on_join_face_vr():
+    """
+    Cliente entra na sala face_vr.
+    Essa sala é usada tanto pela página de câmera quanto pela cena VR.
+    """
+    join_room("face_vr")
+    connected_clients["face_vr"] += 1
+    logger.info("Cliente entrou na sala face_vr. Total: %d", connected_clients["face_vr"])
+    emit("face_vr_ready", {"message": "Rastreamento de rostos → VR pronto."})
+
+
+@socketio.on("leave_face_vr")
+def on_leave_face_vr():
+    leave_room("face_vr")
+    connected_clients["face_vr"] = max(0, connected_clients["face_vr"] - 1)
+
+
+@socketio.on("face_vr_frame")
+def on_face_vr_frame(data):
+    """
+    Recebe um frame da câmera (base64), detecta rostos com Haar Cascade,
+    mapeia cada rosto para coordenadas 3D e faz broadcast para todos
+    os clientes na sala face_vr.
+
+    Payload de entrada:
+        data = {"image": "<base64 JPEG>"}
+
+    Payload de saída (evento 'face_vr_update'):
+        {
+          "faces": [
+            {
+              "id": 1,           # índice do rosto (começa em 1)
+              "label": "Pessoa 1",
+              "vr": {"x": 2.1, "y": 1.5, "z": -4.3, "scale": 0.65},
+              "bbox": {"x": 120, "y": 80, "w": 90, "h": 90}  # coords na imagem
+            },
+            ...
+          ],
+          "count": 2,            # total de rostos detectados
+          "image": "<base64>"    # frame anotado com os bounding boxes
+        }
+    """
+    image_b64 = data.get("image", "")
+
+    try:
+        # ── 1. Decodificar frame base64 → array numpy ──────────────────────
+        _, encoded = image_b64.split(",", 1) if "," in image_b64 else ("", image_b64)
+        img_bytes = base64.b64decode(encoded)
+        np_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            emit("face_vr_update", {"error": "Frame inválido.", "faces": [], "count": 0})
+            return
+
+        _, frame_w = frame.shape[:2]
+        annotated = frame.copy()
+
+        # ── 2. Detecção de rostos com Haar Cascade ─────────────────────────
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # scaleFactor=1.1: reduz imagem 10% a cada escala (detecta rostos em vários tamanhos)
+        # minNeighbors=5:  mínimo de retângulos vizinhos para considerar detecção válida
+        # minSize=(40,40):  ignora rostos menores que 40x40 pixels (reduz falsos positivos)
+        faces_detected = _face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+        )
+
+        face_list = []
+
+        for idx, (x, y, w, h) in enumerate(faces_detected):
+            face_id = idx + 1
+            label = f"Pessoa {face_id}"
+
+            # ── 3. Mapear coordenadas 2D → 3D VR ──────────────────────────
+            bbox = {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
+            vr_pos = _map_face_to_vr(bbox, frame_w)
+
+            face_list.append({
+                "id": face_id,
+                "label": label,
+                "vr": vr_pos,   # posição no mundo VR
+                "bbox": bbox,   # posição no frame da câmera
+            })
+
+            # ── 4. Anotar o frame com retângulo e label ────────────────────
+            # Retângulo azul ao redor do rosto
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), (255, 100, 0), 2)
+
+            # Fundo escuro atrás do texto para legibilidade
+            label_text = f"{label} | VR ({vr_pos['x']},{vr_pos['z']})"
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(annotated, (x, y - th - 10), (x + tw + 4, y), (255, 100, 0), -1)
+            cv2.putText(annotated, label_text, (x + 2, y - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        # ── 5. Codificar frame anotado de volta para base64 ─────────────────
+        _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        annotated_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
+
+        # ── 6. Broadcast para TODOS os clientes na sala face_vr ─────────────
+        # Isso permite que a cena VR (aberta em outro dispositivo) receba as posições
+        socketio.emit("face_vr_update", {
+            "faces": face_list,
+            "count": len(face_list),
+            "image": annotated_b64,   # frame anotado para exibir na câmera
+        }, to="face_vr")
+
+    except Exception as exc:
+        logger.exception("Erro no rastreamento face→VR: %s", exc)
+        emit("face_vr_update", {"error": str(exc), "faces": [], "count": 0})
 
 
 # ---------------------------------------------------------------------------
